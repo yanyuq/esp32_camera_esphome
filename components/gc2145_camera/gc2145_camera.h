@@ -1,10 +1,11 @@
 #pragma once
 
 #include "esphome.h"
+#include "esphome/components/camera/camera.h" // 【新增】必须显式引用 Camera 组件头文件
 #include "esp_camera.h"
 #include "img_converters.h"
 
-// 引脚定义：基于你的 CameraWebServer/camera_pins.h 中的 ESP32S3_EYE 定义
+// 引脚定义保持不变
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 15
@@ -26,16 +27,16 @@
 
 namespace gc2145_camera {
 
-class GC2145Camera : public camera::Camera, public Component {
+// 使用 esphome::camera::Camera 和 esphome::Component 确保命名空间正确
+class GC2145Camera : public esphome::camera::Camera, public esphome::Component {
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
   
-  // 重写请求图像的方法，实现软件转码
-  void request_image(camera::CameraImageReader reader) override;
+  // 使用完整的命名空间
+  void request_image(esphome::camera::CameraImageReader reader) override;
 
-  // 设置参数的方法
   void set_vflip(bool vflip) { this->vflip_ = vflip; }
   void set_hmirror(bool hmirror) { this->hmirror_ = hmirror; }
 
