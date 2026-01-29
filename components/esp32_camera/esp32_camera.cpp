@@ -5,6 +5,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "img_converters.h" 
 
 #include <freertos/task.h>
 
@@ -19,51 +20,50 @@ static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
 
 /* ---------------- public API (derivated) ---------------- */
 void ESP32Camera::setup() {
-#ifdef USE_I2C
-  if (this->i2c_bus_ != nullptr) {
-    this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
-  }
-#endif
-
-  /* initialize time to now */
-  this->last_update_ = millis();
-
-  /* initialize camera */
-//   esp_err_t err = esp_camera_init(&this->config_);
-  #ifdef CONFIG_GC2145_SUPPORT
-      // 只有当我们在 sdkconfig 开启了 GC2145 支持时，才应用这个补丁
-      if (config_.pixel_format == PIXFORMAT_JPEG) {
-          ESP_LOGW("GC2145_PATCH", "Forcing pixel format to YUV422 for GC2145");
-          config_.pixel_format = PIXFORMAT_YUV422; 
-          config_.frame_size = FRAMESIZE_QVGA; 
-          config_.xclk_freq_hz = 10000000;
-          config_.fb_count = 4; // 增加缓冲
-      }
+  #ifdef USE_I2C
+    if (this->i2c_bus_ != nullptr) {
+      this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
+    }
   #endif
-  esp_err_t err = esp_camera_init(&this->config_);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
-    this->init_error_ = err;
-    this->mark_failed();
-    return;
+  
+    /* initialize time to now */
+    this->last_update_ = millis();
+  
+    /* initialize camera */
+    #ifdef CONFIG_GC2145_SUPPORT
+        // 针对 GC2145 的补丁
+        if (config_.pixel_format == PIXFORMAT_JPEG) {
+            ESP_LOGW("GC2145_PATCH", "Forcing pixel format to YUV422 for GC2145");
+            config_.pixel_format = PIXFORMAT_YUV422; 
+            config_.frame_size = FRAMESIZE_QVGA; 
+            config_.xclk_freq_hz = 16000000; // 提高到 16MHz 试试
+            config_.fb_count = 2; 
+        }
+    #endif
+    esp_err_t err = esp_camera_init(&this->config_);
+  
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
+      this->init_error_ = err;
+      this->mark_failed();
+      return;
+    }
+  
+    /* initialize camera parameters */
+    this->update_camera_parameters();
+  
+    /* initialize RTOS */
+    this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+    this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+    xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
+                            "framebuffer_task",           // name
+                            FRAMEBUFFER_TASK_STACK_SIZE,  // stack size
+                            this,                         // task pv params
+                            1,                            // priority
+                            nullptr,                      // handle
+                            1                             // core
+    );
   }
-
-  /* initialize camera parameters */
-  this->update_camera_parameters();
-
-  /* initialize RTOS */
-  this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
-                          "framebuffer_task",           // name
-                          FRAMEBUFFER_TASK_STACK_SIZE,  // stack size
-                          this,                         // task pv params
-                          1,                            // priority
-                          nullptr,                      // handle
-                          1                             // core
-  );
-}
 
 void ESP32Camera::dump_config() {
   auto conf = this->config_;
@@ -181,11 +181,8 @@ void ESP32Camera::dump_config() {
 }
 
 void ESP32Camera::loop() {
-  // Fast path: skip all work when truly idle
-  // (no current image, no pending requests, and not time for idle request yet)
   const uint32_t now = App.get_loop_component_start_time();
   if (!this->current_image_ && !this->has_requested_image_()) {
-    // Only check idle interval when we're otherwise idle
     if (this->idle_update_interval_ != 0 && now - this->last_idle_request_ > this->idle_update_interval_) {
       this->last_idle_request_ = now;
       this->request_image(camera::IDLE);
@@ -194,29 +191,28 @@ void ESP32Camera::loop() {
     }
   }
 
-  // check if we can return the image
+  // 1. 检查是否需要释放上一帧图像
   if (this->can_return_image_()) {
-    // return image
     auto *fb = this->current_image_->get_raw_buffer();
-    xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
+    
+    // 【关键修改】如果是我们手动转换的 JPEG，必须手动 free，不能还给驱动
+    if (this->current_image_->is_custom()) {
+        if (fb->buf) free(fb->buf);
+        free(fb);
+    } else {
+        // 原生图像，归还给驱动
+        xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
+    }
     this->current_image_.reset();
   }
 
-  // Check if we should fetch a new image
-  if (!this->has_requested_image_())
-    return;
-  if (this->current_image_.use_count() > 1) {
-    // image is still in use
-    return;
-  }
-  if (now - this->last_update_ <= this->max_update_interval_)
-    return;
+  if (!this->has_requested_image_()) return;
+  if (this->current_image_.use_count() > 1) return;
+  if (now - this->last_update_ <= this->max_update_interval_) return;
 
-  // request new image
+  // 2. 获取新图像
   camera_fb_t *fb;
   if (xQueueReceive(this->framebuffer_get_queue_, &fb, 0L) != pdTRUE) {
-    // no frame ready
-    ESP_LOGVV(TAG, "No frame ready");
     return;
   }
 
@@ -225,12 +221,51 @@ void ESP32Camera::loop() {
     xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
     return;
   }
-  this->current_image_ = std::make_shared<ESP32CameraImage>(fb, this->single_requesters_ | this->stream_requesters_);
 
+  // 3. 【核心逻辑】如果是 YUV 格式，转码为 JPEG
+  camera_fb_t *final_fb = fb;
+  bool is_sw_converted = false;
+
+  #ifdef CONFIG_GC2145_SUPPORT
+  if (fb->format == PIXFORMAT_YUV422) {
+      uint8_t *jpg_buf = nullptr;
+      size_t jpg_len = 0;
+      // 调用 ESP-IDF 的转码库，质量 12 (0-63, 越小越好)
+      bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
+      
+      if (converted) {
+          // 原始 YUV 数据已经没用了，立刻还给驱动，释放 DMA 缓存
+          esp_camera_fb_return(fb);
+          
+          // 创建一个新的“伪造”fb 给 ESPHome 使用
+          final_fb = (camera_fb_t *)malloc(sizeof(camera_fb_t));
+          final_fb->buf = jpg_buf;
+          final_fb->len = jpg_len;
+          final_fb->width = fb->width;
+          final_fb->height = fb->height;
+          final_fb->format = PIXFORMAT_JPEG;
+          final_fb->timestamp = fb->timestamp;
+          
+          is_sw_converted = true;
+          // ESP_LOGD(TAG, "Converted YUV to JPEG: %u bytes", jpg_len);
+      } else {
+          ESP_LOGE(TAG, "YUV to JPEG conversion failed!");
+          // 失败了就只能发 YUV 了，或者在这里 drop
+      }
+  }
+  #endif
+
+  // 创建 Image 对象，并传入 is_custom 标记
+  this->current_image_ = std::make_shared<ESP32CameraImage>(
+      final_fb, 
+      this->single_requesters_ | this->stream_requesters_, 
+      is_sw_converted // 【关键】传入标记
+  );
+
+  // (日志和监听器部分保持不变)
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
-  ESP_LOGV(TAG, "Got Image: len=%u", fb->len);
+  ESP_LOGV(TAG, "Got Image: len=%u", final_fb->len);
 #else
-  // Initialize log time on first frame to ensure accurate interval measurement
   if (this->frame_count_ == 0) {
     this->last_log_time_ = now;
   }
@@ -469,8 +504,9 @@ void ESP32CameraImageReader::consume_data(size_t consumed) { this->offset_ += co
 uint8_t *ESP32CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
 
 /* ---------------- ESP32CameraImage class ----------- */
-ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters)
-    : buffer_(buffer), requesters_(requesters) {}
+// 【修改4】更新构造函数实现
+ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, bool is_custom)
+    : buffer_(buffer), requesters_(requesters), is_custom_(is_custom) {}
 
 camera_fb_t *ESP32CameraImage::get_raw_buffer() { return this->buffer_; }
 uint8_t *ESP32CameraImage::get_data_buffer() { return this->buffer_->buf; }

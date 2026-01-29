@@ -77,15 +77,18 @@ enum ESP32SpecialEffect {
 /* ---------------- CameraImage class ---------------- */
 class ESP32CameraImage : public camera::CameraImage {
  public:
-  ESP32CameraImage(camera_fb_t *buffer, uint8_t requester);
+ ESP32CameraImage(camera_fb_t *buffer, uint8_t requester, bool is_custom = false);
   camera_fb_t *get_raw_buffer();
   uint8_t *get_data_buffer() override;
   size_t get_data_length() override;
   bool was_requested_by(camera::CameraRequester requester) const override;
 
+  bool is_custom() const { return is_custom_; }
+
  protected:
   camera_fb_t *buffer_;
   uint8_t requesters_;
+  bool is_custom_;
 };
 
 struct CameraImageData {
