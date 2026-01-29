@@ -13,7 +13,7 @@ namespace esphome {
 namespace esp32_camera {
 
 static const char *const TAG = "esp32_camera";
-static constexpr size_t FRAMEBUFFER_TASK_STACK_SIZE = 1792;
+static constexpr size_t FRAMEBUFFER_TASK_STACK_SIZE = 4096;
 #if ESPHOME_LOG_LEVEL < ESPHOME_LOG_LEVEL_VERBOSE
 static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
 #endif
@@ -33,12 +33,14 @@ void ESP32Camera::setup() {
     #ifdef CONFIG_GC2145_SUPPORT
         // 针对 GC2145 的补丁
         if (config_.pixel_format == PIXFORMAT_JPEG) {
-            ESP_LOGW("GC2145_PATCH", "Forcing pixel format to YUV422 for GC2145");
-            config_.pixel_format = PIXFORMAT_YUV422; 
-            config_.frame_size = FRAMESIZE_QVGA; 
-            config_.xclk_freq_hz = 16000000; // 提高到 16MHz 试试
-            config_.fb_count = 2; 
-        }
+          ESP_LOGW("GC2145_PATCH", "Applying GC2145 Fixes: YUV422, QVGA, 10MHz");
+          config_.pixel_format = PIXFORMAT_YUV422; 
+          config_.frame_size = FRAMESIZE_QVGA; 
+          // 【关键修复】降至 10MHz。GC2145 对时序非常敏感，太快会导致无输出。
+          config_.xclk_freq_hz = 10000000; 
+          config_.fb_count = 2;
+          config_.grab_mode = CAMERA_GRAB_LATEST; // 确保获取最新帧
+      }
     #endif
     esp_err_t err = esp_camera_init(&this->config_);
   
@@ -182,25 +184,16 @@ void ESP32Camera::dump_config() {
 
 void ESP32Camera::loop() {
   const uint32_t now = App.get_loop_component_start_time();
-  if (!this->current_image_ && !this->has_requested_image_()) {
-    if (this->idle_update_interval_ != 0 && now - this->last_idle_request_ > this->idle_update_interval_) {
-      this->last_idle_request_ = now;
-      this->request_image(camera::IDLE);
-    } else {
-      return;
-    }
-  }
-
-  // 1. 检查是否需要释放上一帧图像
+  
+  // 1. 释放上一帧
   if (this->can_return_image_()) {
     auto *fb = this->current_image_->get_raw_buffer();
-    
-    // 【关键修改】如果是我们手动转换的 JPEG，必须手动 free，不能还给驱动
+    // 如果是手动 malloc 的 JPEG，需要 free
     if (this->current_image_->is_custom()) {
         if (fb->buf) free(fb->buf);
         free(fb);
     } else {
-        // 原生图像，归还给驱动
+        // 原生 fb，归还给驱动
         xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
     }
     this->current_image_.reset();
@@ -210,19 +203,18 @@ void ESP32Camera::loop() {
   if (this->current_image_.use_count() > 1) return;
   if (now - this->last_update_ <= this->max_update_interval_) return;
 
-  // 2. 获取新图像
+  // 2. 接收新帧
   camera_fb_t *fb;
   if (xQueueReceive(this->framebuffer_get_queue_, &fb, 0L) != pdTRUE) {
     return;
   }
 
   if (fb == nullptr) {
-    ESP_LOGW(TAG, "Got invalid frame from camera!");
-    xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
+    ESP_LOGW(TAG, "Got NULL frame from driver!");
     return;
   }
 
-  // 3. 【核心逻辑】如果是 YUV 格式，转码为 JPEG
+  // 3. YUV -> JPEG 转码
   camera_fb_t *final_fb = fb;
   bool is_sw_converted = false;
 
@@ -230,14 +222,14 @@ void ESP32Camera::loop() {
   if (fb->format == PIXFORMAT_YUV422) {
       uint8_t *jpg_buf = nullptr;
       size_t jpg_len = 0;
-      // 调用 ESP-IDF 的转码库，质量 12 (0-63, 越小越好)
+      // 质量 12，数值越小画质越高(10-63)
       bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
       
       if (converted) {
-          // 原始 YUV 数据已经没用了，立刻还给驱动，释放 DMA 缓存
+          // 转码成功，立即释放原始 YUV 缓存给驱动，防止驱动堵塞
           esp_camera_fb_return(fb);
           
-          // 创建一个新的“伪造”fb 给 ESPHome 使用
+          // 封装新的 JPEG fb
           final_fb = (camera_fb_t *)malloc(sizeof(camera_fb_t));
           final_fb->buf = jpg_buf;
           final_fb->len = jpg_len;
@@ -250,32 +242,18 @@ void ESP32Camera::loop() {
           // ESP_LOGD(TAG, "Converted YUV to JPEG: %u bytes", jpg_len);
       } else {
           ESP_LOGE(TAG, "YUV to JPEG conversion failed!");
-          // 失败了就只能发 YUV 了，或者在这里 drop
+          // 失败了依然发送原始数据，或者选择丢弃
       }
   }
   #endif
 
-  // 创建 Image 对象，并传入 is_custom 标记
   this->current_image_ = std::make_shared<ESP32CameraImage>(
       final_fb, 
       this->single_requesters_ | this->stream_requesters_, 
-      is_sw_converted // 【关键】传入标记
+      is_sw_converted
   );
 
-  // (日志和监听器部分保持不变)
-#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
-  ESP_LOGV(TAG, "Got Image: len=%u", final_fb->len);
-#else
-  if (this->frame_count_ == 0) {
-    this->last_log_time_ = now;
-  }
-  this->frame_count_++;
-  if (now - this->last_log_time_ >= FRAME_LOG_INTERVAL_MS) {
-    ESP_LOGD(TAG, "Received %u images in last %us", this->frame_count_, FRAME_LOG_INTERVAL_MS / 1000);
-    this->last_log_time_ = now;
-    this->frame_count_ = 0;
-  }
-#endif
+  // 通知监听器
   for (auto *listener : this->listeners_) {
     listener->on_camera_image(this->current_image_);
   }
@@ -474,15 +452,20 @@ bool ESP32Camera::can_return_image_() const { return this->current_image_.use_co
 void ESP32Camera::framebuffer_task(void *pv) {
   ESP32Camera *that = (ESP32Camera *) pv;
   while (true) {
-    camera_fb_t *framebuffer = esp_camera_fb_get();
-    xQueueSend(that->framebuffer_get_queue_, &framebuffer, portMAX_DELAY);
-    // Only wake the main loop if there's a pending request to consume the frame
-#if defined(USE_SOCKET_SELECT_SUPPORT) && defined(USE_WAKE_LOOP_THREADSAFE)
-    if (that->has_requested_image_()) {
-      App.wake_loop_threadsafe();
+    // 【调试信息】打印这行看任务是否活着
+    ESP_LOGD(TAG, "Driver: Waiting for VSYNC..."); 
+    
+    // 这里是阻塞调用，如果硬件没输出 VSYNC 信号，会一直卡在这里
+    camera_fb_t *framebuffer = esp_camera_fb_get(); 
+    
+    if (framebuffer) {
+        // ESP_LOGD(TAG, "Driver: Got frame! len=%u", framebuffer->len);
+        xQueueSend(that->framebuffer_get_queue_, &framebuffer, portMAX_DELAY);
+    } else {
+        ESP_LOGW(TAG, "Driver: Failed to get frame (Timeout)");
     }
-#endif
-    // return is no-op for config with 1 fb
+
+    // 接收归还的 buffer
     xQueueReceive(that->framebuffer_return_queue_, &framebuffer, portMAX_DELAY);
     esp_camera_fb_return(framebuffer);
   }
