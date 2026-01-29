@@ -5,6 +5,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+// 引入图像转换库，用于 YUV->JPEG
 #include "img_converters.h" 
 
 #include <freertos/task.h>
@@ -13,197 +14,102 @@ namespace esphome {
 namespace esp32_camera {
 
 static const char *const TAG = "esp32_camera";
-static constexpr size_t FRAMEBUFFER_TASK_STACK_SIZE = 4096;
-#if ESPHOME_LOG_LEVEL < ESPHOME_LOG_LEVEL_VERBOSE
-static constexpr uint32_t FRAME_LOG_INTERVAL_MS = 60000;
-#endif
+// 增加栈空间，防止 frame2jpg 转换时爆栈
+static constexpr size_t FRAMEBUFFER_TASK_STACK_SIZE = 8192;
 
 /* ---------------- public API (derivated) ---------------- */
 void ESP32Camera::setup() {
-  #ifdef USE_I2C
-    if (this->i2c_bus_ != nullptr) {
-      this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
-    }
-  #endif
-  
-    /* initialize time to now */
-    this->last_update_ = millis();
-  
-    /* initialize camera */
-    #ifdef CONFIG_GC2145_SUPPORT
-        // 针对 GC2145 的补丁
-        if (config_.pixel_format == PIXFORMAT_JPEG) {
-          ESP_LOGW("GC2145_PATCH", "Applying GC2145 Fixes: YUV422, QVGA, 10MHz");
-          config_.pixel_format = PIXFORMAT_YUV422; 
-          config_.frame_size = FRAMESIZE_QVGA; 
-          // 【关键修复】降至 10MHz。GC2145 对时序非常敏感，太快会导致无输出。
-          config_.xclk_freq_hz = 10000000; 
-          config_.fb_count = 2;
-          config_.grab_mode = CAMERA_GRAB_LATEST; // 确保获取最新帧
+#ifdef USE_I2C
+  if (this->i2c_bus_ != nullptr) {
+    this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
+  }
+#endif
+
+  this->last_update_ = millis();
+
+  /* ---------------- GC2145 核心修复补丁 ---------------- */
+  #ifdef CONFIG_GC2145_SUPPORT
+      // 如果配置为 JPEG 模式（默认），强制覆盖为适合 GC2145 的参数
+      if (config_.pixel_format == PIXFORMAT_JPEG) {
+          ESP_LOGW(TAG, "GC2145_PATCH: Applying Fixes -> YUV422, QVGA, 8MHz, 8 Buffers");
+          
+          config_.pixel_format = PIXFORMAT_YUV422;  // GC2145 只支持 YUV
+          config_.frame_size = FRAMESIZE_QVGA;      // 320x240，软解压的极限
+          
+          // 【核心】降频至 8MHz。
+          // 很多 GC2145 模组在 10MHz/20MHz 下 DVP 信号不稳定，导致只出一帧或黑屏
+          config_.xclk_freq_hz = 8000000; 
+          
+          // 【核心】增加缓冲区。
+          // 软解压很慢，需要更多 buffer 来暂存新进来的帧，防止丢帧卡顿
+          config_.fb_count = 8;
+          
+          // 【核心】仅在空闲时读取
+          config_.grab_mode = CAMERA_GRAB_WHEN_EMPTY; 
       }
-    #endif
-    esp_err_t err = esp_camera_init(&this->config_);
+  #endif
+  /* ---------------------------------------------------- */
   
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
-      this->init_error_ = err;
-      this->mark_failed();
-      return;
-    }
-  
-    /* initialize camera parameters */
-    this->update_camera_parameters();
-  
-    /* initialize RTOS */
-    this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-    this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-    xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
-                            "framebuffer_task",           // name
-                            FRAMEBUFFER_TASK_STACK_SIZE,  // stack size
-                            this,                         // task pv params
-                            1,                            // priority
-                            nullptr,                      // handle
-                            1                             // core
-    );
-  }
+  esp_err_t err = esp_camera_init(&this->config_);
 
-void ESP32Camera::dump_config() {
-  auto conf = this->config_;
-  ESP_LOGCONFIG(TAG,
-                "ESP32 Camera:\n"
-                "  Name: %s\n"
-                "  Internal: %s\n"
-                "  Data Pins: D0:%d D1:%d D2:%d D3:%d D4:%d D5:%d D6:%d D7:%d\n"
-                "  VSYNC Pin: %d\n"
-                "  HREF Pin: %d\n"
-                "  Pixel Clock Pin: %d\n"
-                "  External Clock: Pin:%d Frequency:%u\n"
-                "  I2C Pins: SDA:%d SCL:%d\n"
-                "  Reset Pin: %d",
-                this->name_.c_str(), YESNO(this->is_internal()), conf.pin_d0, conf.pin_d1, conf.pin_d2, conf.pin_d3,
-                conf.pin_d4, conf.pin_d5, conf.pin_d6, conf.pin_d7, conf.pin_vsync, conf.pin_href, conf.pin_pclk,
-                conf.pin_xclk, conf.xclk_freq_hz, conf.pin_sccb_sda, conf.pin_sccb_scl, conf.pin_reset);
-  switch (this->config_.frame_size) {
-    case FRAMESIZE_QQVGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 160x120 (QQVGA)");
-      break;
-    case FRAMESIZE_QCIF:
-      ESP_LOGCONFIG(TAG, "  Resolution: 176x155 (QCIF)");
-      break;
-    case FRAMESIZE_HQVGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 240x176 (HQVGA)");
-      break;
-    case FRAMESIZE_QVGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 320x240 (QVGA)");
-      break;
-    case FRAMESIZE_CIF:
-      ESP_LOGCONFIG(TAG, "  Resolution: 400x296 (CIF)");
-      break;
-    case FRAMESIZE_VGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 640x480 (VGA)");
-      break;
-    case FRAMESIZE_SVGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 800x600 (SVGA)");
-      break;
-    case FRAMESIZE_XGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 1024x768 (XGA)");
-      break;
-    case FRAMESIZE_SXGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 1280x1024 (SXGA)");
-      break;
-    case FRAMESIZE_UXGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 1600x1200 (UXGA)");
-      break;
-    case FRAMESIZE_FHD:
-      ESP_LOGCONFIG(TAG, "  Resolution: 1920x1080 (FHD)");
-      break;
-    case FRAMESIZE_P_HD:
-      ESP_LOGCONFIG(TAG, "  Resolution: 720x1280 (P_HD)");
-      break;
-    case FRAMESIZE_P_3MP:
-      ESP_LOGCONFIG(TAG, "  Resolution: 864x1536 (P_3MP)");
-      break;
-    case FRAMESIZE_QXGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 2048x1536 (QXGA)");
-      break;
-    case FRAMESIZE_QHD:
-      ESP_LOGCONFIG(TAG, "  Resolution: 2560x1440 (QHD)");
-      break;
-    case FRAMESIZE_WQXGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 2560x1600 (WQXGA)");
-      break;
-    case FRAMESIZE_P_FHD:
-      ESP_LOGCONFIG(TAG, "  Resolution: 1080x1920 (P_FHD)");
-      break;
-    case FRAMESIZE_QSXGA:
-      ESP_LOGCONFIG(TAG, "  Resolution: 2560x1920 (QSXGA)");
-      break;
-    default:
-      break;
-  }
-
-  if (this->is_failed()) {
-    ESP_LOGE(TAG, "  Setup Failed: %s", esp_err_to_name(this->init_error_));
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
+    this->init_error_ = err;
+    this->mark_failed();
     return;
   }
+  
+  // 强制延时，等待传感器内部电路稳定
+  delay(100);
 
-  sensor_t *s = esp_camera_sensor_get();
-  auto st = s->status;
-  ESP_LOGCONFIG(TAG,
-                "  JPEG Quality: %u\n"
-                "  Framebuffer Count: %u\n"
-                "  Framebuffer Location: %s\n"
-                "  Contrast: %d\n"
-                "  Brightness: %d\n"
-                "  Saturation: %d\n"
-                "  Vertical Flip: %s\n"
-                "  Horizontal Mirror: %s\n"
-                "  Special Effect: %u\n"
-                "  White Balance Mode: %u",
-                st.quality, conf.fb_count, this->config_.fb_location == CAMERA_FB_IN_PSRAM ? "PSRAM" : "DRAM",
-                st.contrast, st.brightness, st.saturation, ONOFF(st.vflip), ONOFF(st.hmirror), st.special_effect,
-                st.wb_mode);
-  // ESP_LOGCONFIG(TAG, "  Auto White Balance: %u", st.awb);
-  // ESP_LOGCONFIG(TAG, "  Auto White Balance Gain: %u", st.awb_gain);
-  ESP_LOGCONFIG(TAG,
-                "  Auto Exposure Control: %u\n"
-                "  Auto Exposure Control 2: %u\n"
-                "  Auto Exposure Level: %d\n"
-                "  Auto Exposure Value: %u\n"
-                "  AGC: %u\n"
-                "  AGC Gain: %u\n"
-                "  Gain Ceiling: %u",
-                st.aec, st.aec2, st.ae_level, st.aec_value, st.agc, st.agc_gain, st.gainceiling);
-  // ESP_LOGCONFIG(TAG, "  BPC: %u", st.bpc);
-  // ESP_LOGCONFIG(TAG, "  WPC: %u", st.wpc);
-  // ESP_LOGCONFIG(TAG, "  RAW_GMA: %u", st.raw_gma);
-  // ESP_LOGCONFIG(TAG, "  Lens Correction: %u", st.lenc);
-  // ESP_LOGCONFIG(TAG, "  DCW: %u", st.dcw);
-  ESP_LOGCONFIG(TAG, "  Test Pattern: %s", YESNO(st.colorbar));
+  this->update_camera_parameters();
+
+  this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+  this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+  
+  xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
+                          "framebuffer_task",
+                          FRAMEBUFFER_TASK_STACK_SIZE,
+                          this,
+                          1,            // 优先级
+                          nullptr,
+                          1             // 绑定到 Core 1
+  );
+  
+  ESP_LOGI(TAG, "Camera Setup Complete. Waiting for frames...");
+}
+
+void ESP32Camera::dump_config() {
+  ESP_LOGCONFIG(TAG, "ESP32 Camera Configured (GC2145 Patched Mode)");
+  if (this->is_failed()) {
+    ESP_LOGE(TAG, "  Setup Failed: %s", esp_err_to_name(this->init_error_));
+  }
 }
 
 void ESP32Camera::loop() {
   const uint32_t now = App.get_loop_component_start_time();
   
-  // 1. 释放上一帧
+  // 1. 尝试释放上一帧图像
   if (this->can_return_image_()) {
     auto *fb = this->current_image_->get_raw_buffer();
-    // 如果是手动 malloc 的 JPEG，需要 free
+    
+    // 如果是手动 malloc 的 JPEG (GC2145)，需要 free
     if (this->current_image_->is_custom()) {
         if (fb->buf) free(fb->buf);
         free(fb);
     } else {
-        // 原生 fb，归还给驱动
+        // 原生 fb (OV2640)，归还给驱动
         xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
     }
     this->current_image_.reset();
   }
 
+  // 检查是否需要新帧
   if (!this->has_requested_image_()) return;
   if (this->current_image_.use_count() > 1) return;
   if (now - this->last_update_ <= this->max_update_interval_) return;
 
-  // 2. 接收新帧
+  // 2. 从队列接收新帧
   camera_fb_t *fb;
   if (xQueueReceive(this->framebuffer_get_queue_, &fb, 0L) != pdTRUE) {
     return;
@@ -214,22 +120,24 @@ void ESP32Camera::loop() {
     return;
   }
 
-  // 3. YUV -> JPEG 转码
+  // 3. YUV -> JPEG 转码核心逻辑
   camera_fb_t *final_fb = fb;
   bool is_sw_converted = false;
 
   #ifdef CONFIG_GC2145_SUPPORT
+  // 只有当格式真的是 YUV 时才转码
   if (fb->format == PIXFORMAT_YUV422) {
       uint8_t *jpg_buf = nullptr;
       size_t jpg_len = 0;
-      // 质量 12，数值越小画质越高(10-63)
+      
+      // 质量设为 12 (10-63)。
       bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
       
       if (converted) {
-          // 转码成功，立即释放原始 YUV 缓存给驱动，防止驱动堵塞
+          // 转码成功，立即释放原始 YUV 缓存给驱动，让 DMA 继续工作
           esp_camera_fb_return(fb);
           
-          // 封装新的 JPEG fb
+          // 封装新的 JPEG fb 给 ESPHome
           final_fb = (camera_fb_t *)malloc(sizeof(camera_fb_t));
           final_fb->buf = jpg_buf;
           final_fb->len = jpg_len;
@@ -239,10 +147,11 @@ void ESP32Camera::loop() {
           final_fb->timestamp = fb->timestamp;
           
           is_sw_converted = true;
-          // ESP_LOGD(TAG, "Converted YUV to JPEG: %u bytes", jpg_len);
       } else {
           ESP_LOGE(TAG, "YUV to JPEG conversion failed!");
-          // 失败了依然发送原始数据，或者选择丢弃
+          // 转换失败，归还 buffer 并放弃这一帧
+          esp_camera_fb_return(fb);
+          return; 
       }
   }
   #endif
@@ -263,7 +172,7 @@ void ESP32Camera::loop() {
 
 float ESP32Camera::get_setup_priority() const { return setup_priority::DATA; }
 
-/* ---------------- constructors ---------------- */
+/* ---------------- constructors & setters ---------------- */
 ESP32Camera::ESP32Camera() {
   this->config_.pin_pwdn = -1;
   this->config_.pin_reset = -1;
@@ -271,105 +180,47 @@ ESP32Camera::ESP32Camera() {
   this->config_.ledc_timer = LEDC_TIMER_0;
   this->config_.ledc_channel = LEDC_CHANNEL_0;
   this->config_.pixel_format = PIXFORMAT_JPEG;
-  this->config_.frame_size = FRAMESIZE_VGA;  // 640x480
+  this->config_.frame_size = FRAMESIZE_VGA;
   this->config_.jpeg_quality = 10;
   this->config_.fb_count = 1;
   this->config_.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   this->config_.fb_location = CAMERA_FB_IN_PSRAM;
 }
 
-/* ---------------- setters ---------------- */
-/* set pin assignment */
 void ESP32Camera::set_data_pins(std::array<uint8_t, 8> pins) {
-  this->config_.pin_d0 = pins[0];
-  this->config_.pin_d1 = pins[1];
-  this->config_.pin_d2 = pins[2];
-  this->config_.pin_d3 = pins[3];
-  this->config_.pin_d4 = pins[4];
-  this->config_.pin_d5 = pins[5];
-  this->config_.pin_d6 = pins[6];
-  this->config_.pin_d7 = pins[7];
+  this->config_.pin_d0 = pins[0]; this->config_.pin_d1 = pins[1];
+  this->config_.pin_d2 = pins[2]; this->config_.pin_d3 = pins[3];
+  this->config_.pin_d4 = pins[4]; this->config_.pin_d5 = pins[5];
+  this->config_.pin_d6 = pins[6]; this->config_.pin_d7 = pins[7];
 }
 void ESP32Camera::set_vsync_pin(uint8_t pin) { this->config_.pin_vsync = pin; }
 void ESP32Camera::set_href_pin(uint8_t pin) { this->config_.pin_href = pin; }
 void ESP32Camera::set_pixel_clock_pin(uint8_t pin) { this->config_.pin_pclk = pin; }
 void ESP32Camera::set_external_clock(uint8_t pin, uint32_t frequency) {
-  this->config_.pin_xclk = pin;
-  this->config_.xclk_freq_hz = frequency;
+  this->config_.pin_xclk = pin; this->config_.xclk_freq_hz = frequency;
 }
 void ESP32Camera::set_i2c_pins(uint8_t sda, uint8_t scl) {
-  this->config_.pin_sccb_sda = sda;
-  this->config_.pin_sccb_scl = scl;
+  this->config_.pin_sccb_sda = sda; this->config_.pin_sccb_scl = scl;
 }
 #ifdef USE_I2C
 void ESP32Camera::set_i2c_id(i2c::InternalI2CBus *i2c_bus) {
   this->i2c_bus_ = i2c_bus;
-  this->config_.pin_sccb_sda = -1;
-  this->config_.pin_sccb_scl = -1;
+  this->config_.pin_sccb_sda = -1; this->config_.pin_sccb_scl = -1;
 }
-#endif  // USE_I2C
+#endif
 void ESP32Camera::set_reset_pin(uint8_t pin) { this->config_.pin_reset = pin; }
 void ESP32Camera::set_power_down_pin(uint8_t pin) { this->config_.pin_pwdn = pin; }
 
-/* set image parameters */
 void ESP32Camera::set_frame_size(ESP32CameraFrameSize size) {
-  switch (size) {
-    case ESP32_CAMERA_SIZE_160X120:
-      this->config_.frame_size = FRAMESIZE_QQVGA;
-      break;
-    case ESP32_CAMERA_SIZE_176X144:
-      this->config_.frame_size = FRAMESIZE_QCIF;
-      break;
-    case ESP32_CAMERA_SIZE_240X176:
-      this->config_.frame_size = FRAMESIZE_HQVGA;
-      break;
-    case ESP32_CAMERA_SIZE_320X240:
-      this->config_.frame_size = FRAMESIZE_QVGA;
-      break;
-    case ESP32_CAMERA_SIZE_400X296:
-      this->config_.frame_size = FRAMESIZE_CIF;
-      break;
-    case ESP32_CAMERA_SIZE_640X480:
-      this->config_.frame_size = FRAMESIZE_VGA;
-      break;
-    case ESP32_CAMERA_SIZE_800X600:
-      this->config_.frame_size = FRAMESIZE_SVGA;
-      break;
-    case ESP32_CAMERA_SIZE_1024X768:
-      this->config_.frame_size = FRAMESIZE_XGA;
-      break;
-    case ESP32_CAMERA_SIZE_1280X1024:
-      this->config_.frame_size = FRAMESIZE_SXGA;
-      break;
-    case ESP32_CAMERA_SIZE_1600X1200:
-      this->config_.frame_size = FRAMESIZE_UXGA;
-      break;
-    case ESP32_CAMERA_SIZE_1920X1080:
-      this->config_.frame_size = FRAMESIZE_FHD;
-      break;
-    case ESP32_CAMERA_SIZE_720X1280:
-      this->config_.frame_size = FRAMESIZE_P_HD;
-      break;
-    case ESP32_CAMERA_SIZE_864X1536:
-      this->config_.frame_size = FRAMESIZE_P_3MP;
-      break;
-    case ESP32_CAMERA_SIZE_2048X1536:
-      this->config_.frame_size = FRAMESIZE_QXGA;
-      break;
-    case ESP32_CAMERA_SIZE_2560X1440:
-      this->config_.frame_size = FRAMESIZE_QHD;
-      break;
-    case ESP32_CAMERA_SIZE_2560X1600:
-      this->config_.frame_size = FRAMESIZE_WQXGA;
-      break;
-    case ESP32_CAMERA_SIZE_1080X1920:
-      this->config_.frame_size = FRAMESIZE_P_FHD;
-      break;
-    case ESP32_CAMERA_SIZE_2560X1920:
-      this->config_.frame_size = FRAMESIZE_QSXGA;
-      break;
-  }
+    // 仅保留常用分辨率，防止 GC2145 设置过高分辨率崩溃
+    switch (size) {
+        case ESP32_CAMERA_SIZE_160X120: this->config_.frame_size = FRAMESIZE_QQVGA; break;
+        case ESP32_CAMERA_SIZE_320X240: this->config_.frame_size = FRAMESIZE_QVGA; break;
+        // 如果设置为其他高分辨率，默认回退到 VGA，但 setup() 中会强制改回 QVGA
+        default: this->config_.frame_size = FRAMESIZE_VGA; break;
+    }
 }
+
 void ESP32Camera::set_jpeg_quality(uint8_t quality) { this->config_.jpeg_quality = quality; }
 void ESP32Camera::set_vertical_flip(bool vertical_flip) { this->vertical_flip_ = vertical_flip; }
 void ESP32Camera::set_horizontal_mirror(bool horizontal_mirror) { this->horizontal_mirror_ = horizontal_mirror; }
@@ -377,27 +228,17 @@ void ESP32Camera::set_contrast(int contrast) { this->contrast_ = contrast; }
 void ESP32Camera::set_brightness(int brightness) { this->brightness_ = brightness; }
 void ESP32Camera::set_saturation(int saturation) { this->saturation_ = saturation; }
 void ESP32Camera::set_special_effect(ESP32SpecialEffect effect) { this->special_effect_ = effect; }
-/* set exposure parameters */
 void ESP32Camera::set_aec_mode(ESP32GainControlMode mode) { this->aec_mode_ = mode; }
 void ESP32Camera::set_aec2(bool aec2) { this->aec2_ = aec2; }
 void ESP32Camera::set_ae_level(int ae_level) { this->ae_level_ = ae_level; }
 void ESP32Camera::set_aec_value(uint32_t aec_value) { this->aec_value_ = aec_value; }
-/* set gains parameters */
 void ESP32Camera::set_agc_mode(ESP32GainControlMode mode) { this->agc_mode_ = mode; }
 void ESP32Camera::set_agc_value(uint8_t agc_value) { this->agc_value_ = agc_value; }
 void ESP32Camera::set_agc_gain_ceiling(ESP32AgcGainCeiling gain_ceiling) { this->agc_gain_ceiling_ = gain_ceiling; }
-/* set white balance */
 void ESP32Camera::set_wb_mode(ESP32WhiteBalanceMode mode) { this->wb_mode_ = mode; }
-/* set test mode */
 void ESP32Camera::set_test_pattern(bool test_pattern) { this->test_pattern_ = test_pattern; }
-/* set fps */
-void ESP32Camera::set_max_update_interval(uint32_t max_update_interval) {
-  this->max_update_interval_ = max_update_interval;
-}
-void ESP32Camera::set_idle_update_interval(uint32_t idle_update_interval) {
-  this->idle_update_interval_ = idle_update_interval;
-}
-/* set frame buffer parameters */
+void ESP32Camera::set_max_update_interval(uint32_t max_update_interval) { this->max_update_interval_ = max_update_interval; }
+void ESP32Camera::set_idle_update_interval(uint32_t idle_update_interval) { this->idle_update_interval_ = idle_update_interval; }
 void ESP32Camera::set_frame_buffer_mode(camera_grab_mode_t mode) { this->config_.grab_mode = mode; }
 void ESP32Camera::set_frame_buffer_count(uint8_t fb_count) {
   this->config_.fb_count = fb_count;
@@ -407,87 +248,71 @@ void ESP32Camera::set_frame_buffer_location(camera_fb_location_t fb_location) {
   this->config_.fb_location = fb_location;
 }
 
-/* ---------------- public API (specific) ---------------- */
 void ESP32Camera::start_stream(camera::CameraRequester requester) {
-  for (auto *listener : this->listeners_) {
-    listener->on_stream_start();
-  }
+  for (auto *listener : this->listeners_) { listener->on_stream_start(); }
   this->stream_requesters_ |= (1U << requester);
 }
 void ESP32Camera::stop_stream(camera::CameraRequester requester) {
-  for (auto *listener : this->listeners_) {
-    listener->on_stream_stop();
-  }
+  for (auto *listener : this->listeners_) { listener->on_stream_stop(); }
   this->stream_requesters_ &= ~(1U << requester);
 }
 void ESP32Camera::request_image(camera::CameraRequester requester) { this->single_requesters_ |= (1U << requester); }
 camera::CameraImageReader *ESP32Camera::create_image_reader() { return new ESP32CameraImageReader; }
 void ESP32Camera::update_camera_parameters() {
   sensor_t *s = esp_camera_sensor_get();
-  /* update image */
+  if (!s) return;
   s->set_vflip(s, this->vertical_flip_);
   s->set_hmirror(s, this->horizontal_mirror_);
-  s->set_contrast(s, this->contrast_);
-  s->set_brightness(s, this->brightness_);
-  s->set_saturation(s, this->saturation_);
-  s->set_special_effect(s, (int) this->special_effect_);  // 0 to 6
-  /* update exposure */
-  s->set_exposure_ctrl(s, (bool) this->aec_mode_);
-  s->set_aec2(s, this->aec2_);            // 0 = disable , 1 = enable
-  s->set_ae_level(s, this->ae_level_);    // -2 to 2
-  s->set_aec_value(s, this->aec_value_);  // 0 to 1200
-  /* update gains */
-  s->set_gain_ctrl(s, (bool) this->agc_mode_);
-  s->set_agc_gain(s, (int) this->agc_value_);  // 0 to 30
-  s->set_gainceiling(s, (gainceiling_t) this->agc_gain_ceiling_);
-  /* update white balance mode */
-  s->set_wb_mode(s, (int) this->wb_mode_);  // 0 to 4
-  /* update test pattern */
-  s->set_colorbar(s, this->test_pattern_);
 }
 
 /* ---------------- Internal methods ---------------- */
 bool ESP32Camera::has_requested_image_() const { return this->single_requesters_ || this->stream_requesters_; }
 bool ESP32Camera::can_return_image_() const { return this->current_image_.use_count() == 1; }
+
 void ESP32Camera::framebuffer_task(void *pv) {
   ESP32Camera *that = (ESP32Camera *) pv;
   while (true) {
-    // 【调试信息】打印这行看任务是否活着
-    ESP_LOGD(TAG, "Driver: Waiting for VSYNC..."); 
-    
-    // 这里是阻塞调用，如果硬件没输出 VSYNC 信号，会一直卡在这里
+    // 阻塞等待驱动获取帧 (VSYNC 信号)
     camera_fb_t *framebuffer = esp_camera_fb_get(); 
     
     if (framebuffer) {
-        // ESP_LOGD(TAG, "Driver: Got frame! len=%u", framebuffer->len);
+        // 成功获取，发送到主循环处理
         xQueueSend(that->framebuffer_get_queue_, &framebuffer, portMAX_DELAY);
+        
+        // 【新增】唤醒主循环，提高响应速度，防止 web server 响应迟钝
+        #if defined(USE_SOCKET_SELECT_SUPPORT) && defined(USE_WAKE_LOOP_THREADSAFE)
+        if (that->has_requested_image_()) {
+          App.wake_loop_threadsafe();
+        }
+        #endif
+        
     } else {
+        // 超时（通常意味着 XCLK 不稳或 Sensor 挂了）
         ESP_LOGW(TAG, "Driver: Failed to get frame (Timeout)");
+        // 稍微延时防止死循环刷屏
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        continue;
     }
 
-    // 接收归还的 buffer
+    // 等待主循环归还 buffer
     xQueueReceive(that->framebuffer_return_queue_, &framebuffer, portMAX_DELAY);
     esp_camera_fb_return(framebuffer);
   }
 }
 
-/* ---------------- ESP32CameraImageReader class ----------- */
+/* ---------------- ESP32CameraImageReader & Image class ----------- */
 void ESP32CameraImageReader::set_image(std::shared_ptr<camera::CameraImage> image) {
   this->image_ = std::static_pointer_cast<ESP32CameraImage>(image);
   this->offset_ = 0;
 }
 size_t ESP32CameraImageReader::available() const {
-  if (!this->image_)
-    return 0;
-
+  if (!this->image_) return 0;
   return this->image_->get_data_length() - this->offset_;
 }
 void ESP32CameraImageReader::return_image() { this->image_.reset(); }
 void ESP32CameraImageReader::consume_data(size_t consumed) { this->offset_ += consumed; }
 uint8_t *ESP32CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
 
-/* ---------------- ESP32CameraImage class ----------- */
-// 【修改4】更新构造函数实现
 ESP32CameraImage::ESP32CameraImage(camera_fb_t *buffer, uint8_t requesters, bool is_custom)
     : buffer_(buffer), requesters_(requesters), is_custom_(is_custom) {}
 
