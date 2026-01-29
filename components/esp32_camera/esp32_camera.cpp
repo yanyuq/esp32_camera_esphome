@@ -19,65 +19,61 @@ static constexpr size_t FRAMEBUFFER_TASK_STACK_SIZE = 8192;
 
 /* ---------------- public API (derivated) ---------------- */
 void ESP32Camera::setup() {
-#ifdef USE_I2C
-  if (this->i2c_bus_ != nullptr) {
-    this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
-  }
-#endif
-
-  this->last_update_ = millis();
-
-  /* ---------------- GC2145 核心修复补丁 ---------------- */
-  #ifdef CONFIG_GC2145_SUPPORT
-      // 如果配置为 JPEG 模式（默认），强制覆盖为适合 GC2145 的参数
-      if (config_.pixel_format == PIXFORMAT_JPEG) {
-          ESP_LOGW(TAG, "GC2145_PATCH: Applying Fixes -> YUV422, QVGA, 8MHz, 8 Buffers");
-          
-          config_.pixel_format = PIXFORMAT_YUV422;  // GC2145 只支持 YUV
-          config_.frame_size = FRAMESIZE_QVGA;      // 320x240，软解压的极限
-          
-          // 【核心】降频至 8MHz。
-          // 很多 GC2145 模组在 10MHz/20MHz 下 DVP 信号不稳定，导致只出一帧或黑屏
-          config_.xclk_freq_hz = 8000000; 
-          
-          // 【核心】增加缓冲区。
-          // 软解压很慢，需要更多 buffer 来暂存新进来的帧，防止丢帧卡顿
-          config_.fb_count = 8;
-          
-          // 【核心】仅在空闲时读取
-          config_.grab_mode = CAMERA_GRAB_WHEN_EMPTY; 
-      }
+  #ifdef USE_I2C
+    if (this->i2c_bus_ != nullptr) {
+      this->config_.sccb_i2c_port = this->i2c_bus_->get_port();
+    }
   #endif
-  /* ---------------------------------------------------- */
   
-  esp_err_t err = esp_camera_init(&this->config_);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
-    this->init_error_ = err;
-    this->mark_failed();
-    return;
+    this->last_update_ = millis();
+  
+    /* ---------------- GC2145 ULTRA-STABLE PATCH ---------------- */
+    #ifdef CONFIG_GC2145_SUPPORT
+        if (config_.pixel_format == PIXFORMAT_JPEG) {
+            ESP_LOGW(TAG, "GC2145_PATCH: ULTRASLOW MODE (6MHz)");
+            
+            config_.pixel_format = PIXFORMAT_YUV422; 
+            config_.frame_size = FRAMESIZE_QVGA; 
+            
+            // CRITICAL CHANGE: Drop to 6MHz. 
+            // This is the "Safe Mode" for GC2145.
+            config_.xclk_freq_hz = 6000000; 
+            
+            // Use 4 buffers instead of 8 to save RAM for the stack
+            config_.fb_count = 4;
+            config_.grab_mode = CAMERA_GRAB_LATEST; 
+        }
+    #endif
+    /* ----------------------------------------------------------- */
+    
+    esp_err_t err = esp_camera_init(&this->config_);
+  
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
+      this->init_error_ = err;
+      this->mark_failed();
+      return;
+    }
+    
+    // Wait longer for the sensor to stabilize
+    delay(500);
+  
+    this->update_camera_parameters();
+  
+    this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+    this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
+    
+    xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
+                            "framebuffer_task",
+                            FRAMEBUFFER_TASK_STACK_SIZE,
+                            this,
+                            1,            
+                            nullptr,
+                            1             
+    );
+    
+    ESP_LOGI(TAG, "Camera Setup Complete.");
   }
-  
-  // 强制延时，等待传感器内部电路稳定
-  delay(100);
-
-  this->update_camera_parameters();
-
-  this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  
-  xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
-                          "framebuffer_task",
-                          FRAMEBUFFER_TASK_STACK_SIZE,
-                          this,
-                          1,            // 优先级
-                          nullptr,
-                          1             // 绑定到 Core 1
-  );
-  
-  ESP_LOGI(TAG, "Camera Setup Complete. Waiting for frames...");
-}
 
 void ESP32Camera::dump_config() {
   ESP_LOGCONFIG(TAG, "ESP32 Camera Configured (GC2145 Patched Mode)");
