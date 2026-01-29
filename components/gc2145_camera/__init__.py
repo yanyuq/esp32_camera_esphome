@@ -8,8 +8,7 @@ DEPENDENCIES = ['esp32']
 gc2145_ns = cg.esphome_ns.namespace('gc2145_camera')
 camera_ns = cg.esphome_ns.namespace('camera')
 
-# 【修复 1】安全获取 Entity 类
-# 某些版本直接在 cg 中，某些版本需要从 esphome_ns 获取
+# 1. 兼容性更好的 Entity 获取方式
 try:
     Entity = cg.Entity
 except AttributeError:
@@ -18,8 +17,7 @@ except AttributeError:
 Camera = camera_ns.class_('Camera', Entity)
 GC2145Camera = gc2145_ns.class_('GC2145Camera', Camera, cg.Component)
 
-# 【修复 2】手动定义配置 Schema，不使用 camera.CAMERA_SCHEMA
-# 这样可以避免 "has no attribute 'CAMERA_SCHEMA'" 错误
+# 2. 手动定义配置 Schema，不依赖 camera.CAMERA_SCHEMA
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(GC2145Camera),
     cv.Optional(CONF_NAME): cv.string,
@@ -29,11 +27,20 @@ CONFIG_SCHEMA = cv.Schema({
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
-    # 注册组件基础功能
-    await cg.register_component(var, config)
-    # 注册摄像头功能 (会处理 Name 等基础属性)
-    await camera.register_camera(var, config)
     
+    # 注册为组件 (Component)
+    await cg.register_component(var, config)
+    
+    # 3. 注册为摄像头 (Entity)
+    # 尝试使用标准方法，如果由于环境污染导致方法缺失，则手动设置名称
+    if hasattr(camera, 'register_camera'):
+        await camera.register_camera(var, config)
+    else:
+        # 手动设置 Entity 名称，确保能被 Home Assistant 发现
+        if CONF_NAME in config:
+            cg.add(var.set_name(config[CONF_NAME]))
+
+    # 应用翻转设置
     if "vertical_flip" in config:
         cg.add(var.set_vflip(config["vertical_flip"]))
     if "horizontal_mirror" in config:
