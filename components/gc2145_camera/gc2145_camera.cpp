@@ -26,8 +26,6 @@ void GC2145Camera::setup() {
   config.pin_reset = RESET_GPIO_NUM;
   
   config.xclk_freq_hz = 20000000;
-  
-  // 强制 YUV422 模式，用于后续软件转码
   config.pixel_format = PIXFORMAT_YUV422;
   
   if(psramFound()){
@@ -56,12 +54,10 @@ void GC2145Camera::setup() {
   }
 
   this->init_success_ = true;
-  ESP_LOGI(TAG, "GC2145 Camera initialized successfully in YUV422 mode");
+  ESP_LOGI(TAG, "GC2145 Camera initialized successfully");
 }
 
-void GC2145Camera::loop() {
-  
-}
+void GC2145Camera::loop() {}
 
 void GC2145Camera::dump_config() {
   ESP_LOGCONFIG(TAG, "GC2145 Camera Custom Component:");
@@ -69,11 +65,8 @@ void GC2145Camera::dump_config() {
   ESP_LOGCONFIG(TAG, "  Horizontal Mirror: %s", this->hmirror_ ? "ON" : "OFF");
 }
 
-// 【关键修复】更新参数类型 esphome::camera::CameraImageReader
 void GC2145Camera::request_image(esphome::camera::CameraImageReader reader) {
-  if (!this->init_success_) {
-    return;
-  }
+  if (!this->init_success_) return;
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -82,24 +75,18 @@ void GC2145Camera::request_image(esphome::camera::CameraImageReader reader) {
   }
 
   if (fb->format == PIXFORMAT_JPEG) {
-    // 【关键修复】使用 esphome::camera::CameraImage
     reader.return_image(esphome::camera::CameraImage(fb->buf, fb->len));
   } else {
     uint8_t *jpg_buf = nullptr;
     size_t jpg_len = 0;
-    
-    // 软件转码
     bool converted = frame2jpg(fb, 12, &jpg_buf, &jpg_len);
-
     if (!converted) {
       ESP_LOGE(TAG, "JPEG compression failed");
     } else {
-      // 【关键修复】使用 esphome::camera::CameraImage
       reader.return_image(esphome::camera::CameraImage(jpg_buf, jpg_len));
       free(jpg_buf);
     }
   }
-
   esp_camera_fb_return(fb);
 }
 

@@ -1,10 +1,10 @@
 #pragma once
 
 #include "esphome.h"
+#include "esphome/components/camera/camera.h"  // 这次它会存在的
 #include "esp_camera.h"
 #include "img_converters.h"
 
-// 引脚定义
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 15
@@ -26,14 +26,11 @@
 
 namespace gc2145_camera {
 
-// 【关键修复】使用 esphome::camera::Camera 和 esphome::Component
 class GC2145Camera : public esphome::camera::Camera, public esphome::Component {
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
-  
-  // 【关键修复】使用 esphome::camera::CameraImageReader
   void request_image(esphome::camera::CameraImageReader reader) override;
 
   void set_vflip(bool vflip) { this->vflip_ = vflip; }
