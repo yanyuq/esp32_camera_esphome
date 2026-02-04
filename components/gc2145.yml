@@ -1,0 +1,29 @@
+external_components:
+  - source:
+      type: git
+      url: https://你的GitHub仓库地址.git  # 替换为你的仓库地址
+      ref: main  # 你的分支名
+    components: [esp32_camera]
+    refresh: 30s  # 调试期30s刷新，稳定后改1h
+
+# GC2145摄像头配置（无JPEG，适配自定义组件）
+camera:
+  - platform: esp32_camera
+    name: "GC2145摄像头（无JPEG）"
+    device_class: camera
+    sensor:
+      model: GC2145  # 调用自定义组件注册的GC2145型号
+      # 核心：硬件引脚按你的实际接线修改！！
+      data_pins: [GPIO5, GPIO18, GPIO19, GPIO21, GPIO36, GPIO39, GPIO34, GPIO35]
+      vsync_pin: GPIO25
+      href_pin: GPIO23
+      pixel_clock_pin: GPIO27
+      external_clock:
+        pin: GPIO0
+        frequency: 20MHz
+      # 无JPEG必须指定像素格式，与组件内一致
+      pixel_format: RGB565
+    # 关键：删除jpeg_quality（硬件不支持，留着会报错）
+    frame_size: VGA  # 推荐VGA及以下，避免带宽不足
+    max_framerate: 10fps  # GC2145无JPEG，帧率不宜过高
+    idle_framerate: 1fps  # 闲置低帧率，节省功耗
